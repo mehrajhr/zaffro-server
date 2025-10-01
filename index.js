@@ -61,6 +61,27 @@ async function run() {
       }
     });
 
+    // Get all discounted products (Sale / Offers)
+    app.get("/products/discounts", async (req, res) => {
+      try {
+        const { category } = req.query;
+
+        const filter = { discountPrice: { $ne: null } }; // Only products with discount
+
+        if (category && category !== "all") {
+          filter.category = category;
+        }
+
+        const discountedProducts = await productsCollection
+          .find(filter)
+          .toArray();
+        res.status(200).json(discountedProducts);
+      } catch (error) {
+        console.error("Failed to fetch discounted products:", error);
+        res.status(500).json({ message: "Server error" });
+      }
+    });
+
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log(
