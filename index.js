@@ -1,9 +1,12 @@
+const dotenv = require("dotenv");
+dotenv.config();
 const express = require("express");
 const cors = require("cors");
-const dotenv = require("dotenv");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const admin = require("firebase-admin");
 
-dotenv.config();
+const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT, "base64");
+const serviceAccount = JSON.parse(decoded.toString("utf8"));
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -13,6 +16,10 @@ app.use(cors());
 app.use(express.json());
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.e7tn1md.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
@@ -30,6 +37,130 @@ async function run() {
 
     const db = client.db("zaffro-db");
     const productsCollection = db.collection("products");
+    const ordersCollection = db.collection("orders");
+    const usersCollection = db.collection("users");
+
+    const verifyFBToken = async (req, res, next) => {
+      // console.log('from middleware ', req.headers.authorization);
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res.status(401).send({ message: "unauthorized access" });
+      }
+
+      const token = authHeader.split(" ")[1];
+      if (!token) {
+        return res.status(401).send({ message: "unauthorized access" });
+      }
+
+      // verify the token
+
+      try {
+        const decoded = await admin.auth().verifyIdToken(token);
+        req.decoded = decoded;
+        next();
+      } catch {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+    };
+
+    const verifyAdmin = async (req, res, next) => {
+      try {
+        if (!req.decoded?.email)
+          return res.status(401).send({ message: "unauthorized access" });
+        const email = req.decoded.email;
+        const user = await usersCollection.findOne({ email });
+        if (!user || user.role !== "admin") {
+          return res.status(403).send({ message: "forbidden access" });
+        }
+        next();
+      } catch (err) {
+        console.error("verifyAdmin error:", err);
+        res.status(500).send({ message: "Server error" });
+      }
+    };
+
+    const verifyEmail = async (req, res, next) => {
+      if (req.decoded.email !== req.query.email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      next();
+    };
+
+    app.post("/users", async (req, res) => {
+      try {
+        const user = req.body;
+        const email = user.email;
+
+        if (!email) {
+          return res.status(400).json({ message: "Email is required" });
+        }
+
+        const existingUser = await usersCollection.findOne({ email });
+
+        if (existingUser) {
+          await usersCollection.updateOne(
+            { email },
+            { $set: { last_login: new Date().toISOString() } }
+          );
+          return res
+            .status(200)
+            .json({ message: "User already exists", updated: true });
+        }
+
+        const result = await usersCollection.insertOne(user);
+        return res
+          .status(201)
+          .json({ message: "New user created", insertedId: result.insertedId });
+      } catch (error) {
+        console.error("Error saving user:", error);
+        return res.status(500).json({ message: "Server error" });
+      }
+    });
+    app.get("/users", verifyFBToken, verifyAdmin, async (req, res, next) => {
+      const result = await usersCollection.find().toArray();
+      res.send(result);
+    });
+    app.get("/role/users", verifyFBToken , verifyEmail, async (req, res , next) => {
+      const email = req.query.email;
+      const user = await usersCollection.findOne({ email });
+
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      res.send({ role: user.role });
+    });
+    app.patch("/users/:id/role", verifyFBToken, verifyAdmin, async (req, res , next) => {
+      try {
+        const { id } = req.params;
+        const { role } = req.body;
+
+        // ✅ Validate role
+        if (!["admin", "customer"].includes(role)) {
+          return res.status(400).json({ message: "Invalid role value" });
+        }
+
+        // ✅ Update user role
+        const result = await db
+          .collection("users")
+          .updateOne({ _id: new ObjectId(id) }, { $set: { role: role } });
+
+        if (result.modifiedCount === 0) {
+          return res
+            .status(404)
+            .json({ message: "User not found or role unchanged" });
+        }
+
+        res.json({
+          success: true,
+          message: `User role updated to ${role}`,
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        console.error("Error updating role:", error);
+        res.status(500).json({ message: "Internal server error" });
+      }
+    });
 
     // for products
     app.get("/products", async (req, res) => {
@@ -117,10 +248,9 @@ async function run() {
     // for orders manage by admin
 
     // GET /orders using admin only
-    app.get("/orders", async (req, res) => {
+    app.get("/orders", verifyFBToken , verifyAdmin, async (req, res , next) => {
       try {
-        const orders = await db
-          .collection("orders")
+        const orders = await ordersCollection
           .find()
           .sort({ createdAt: -1 })
           .toArray();
@@ -133,7 +263,7 @@ async function run() {
 
     // reminder : its using by user
     app.post("/orders", async (req, res) => {
-      const session = db.client.startSession();
+      const session = client.startSession();
 
       try {
         const order = req.body;
@@ -150,9 +280,9 @@ async function run() {
         await session.withTransaction(async () => {
           // Loop through each ordered item
           for (const item of order.items) {
-            const product = await db
-              .collection("products")
-              .findOne({ _id: new ObjectId(item.productId) });
+            const product = await productsCollection.findOne({
+              _id: new ObjectId(item.productId),
+            });
 
             if (!product) {
               throw new Error(`Product not found: ${item.productId}`);
@@ -181,19 +311,15 @@ async function run() {
             product.sizes[sizeIndex].stock -= item.quantity;
 
             // Update the product in DB
-            await db
-              .collection("products")
-              .updateOne(
-                { _id: new ObjectId(item.productId) },
-                { $set: { sizes: product.sizes } },
-                { session }
-              );
+            await productsCollection.updateOne(
+              { _id: new ObjectId(item.productId) },
+              { $set: { sizes: product.sizes } },
+              { session }
+            );
           }
 
           // Insert order
-          const result = await db
-            .collection("orders")
-            .insertOne(order, { session });
+          const result = await ordersCollection.insertOne(order, { session });
           res.status(201).json({ success: true, orderId: result.insertedId });
         });
       } catch (err) {
@@ -207,7 +333,7 @@ async function run() {
     });
 
     // PATCH / order status change
-    app.patch("/orders/:orderId", async (req, res) => {
+    app.patch("/orders/:orderId", verifyFBToken, verifyAdmin , async (req, res , next) => {
       const session = db.client.startSession();
 
       try {
@@ -280,13 +406,20 @@ async function run() {
       }
     });
 
+    app.delete("/orders/:id", verifyFBToken , verifyAdmin , async (req, res , next) => {
+      const { id } = req.params;
+      const query = { _id: new ObjectId(id) };
+      const result = await ordersCollection.deleteOne(query);
+      res.send(result);
+    });
+
     // GET order information using admin only
-    app.get("/orders/:orderId", async (req, res) => {
+    app.get("/orders/:orderId", verifyFBToken, verifyAdmin, async (req, res , next) => {
       try {
         const { orderId } = req.params;
-        const order = await db
-          .collection("orders")
-          .findOne({ _id: new ObjectId(orderId) });
+        const order = await ordersCollection.findOne({
+          _id: new ObjectId(orderId),
+        });
 
         if (!order) {
           return res.status(404).json({ message: "Order not found" });
@@ -300,7 +433,7 @@ async function run() {
     });
 
     // for product manage by admin
-    app.delete("/products/:id", async (req, res) => {
+    app.delete("/products/:id", verifyFBToken , verifyAdmin, async (req, res , next) => {
       try {
         const id = req.params.id;
         if (!ObjectId.isValid(id)) {
@@ -323,7 +456,7 @@ async function run() {
     });
 
     // PATCH /orders/:orderId order details
-    app.patch("/api/orders/:orderId", async (req, res) => {
+    app.patch("/api/orders/:orderId", verifyFBToken, verifyAdmin , async (req, res , next) => {
       try {
         const { orderId } = req.params;
         const { orderStatus } = req.body;
@@ -332,9 +465,10 @@ async function run() {
           return res.status(400).json({ message: "orderStatus is required" });
         }
 
-        const result = await db
-          .collection("orders")
-          .updateOne({ _id: new ObjectId(orderId) }, { $set: { orderStatus } });
+        const result = await ordersCollection.updateOne(
+          { _id: new ObjectId(orderId) },
+          { $set: { orderStatus } }
+        );
 
         if (result.modifiedCount === 0) {
           return res
@@ -352,7 +486,7 @@ async function run() {
     });
 
     // Add a new product
-    app.post("/products", async (req, res) => {
+    app.post("/products", verifyFBToken, verifyAdmin,  async (req, res , next) => {
       try {
         const newProduct = req.body;
         const result = await productsCollection.insertOne(newProduct);
@@ -362,7 +496,7 @@ async function run() {
       }
     });
 
-    app.put("/products/:id", async (req, res) => {
+    app.put("/products/:id", verifyFBToken , verifyAdmin,  async (req, res , next) => {
       const id = req.params.id;
       try {
         const updateData = req.body;
